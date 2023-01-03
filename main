@@ -1,0 +1,129 @@
+import os
+import sys
+import torch
+import pickle
+import random
+import argparse
+import numpy as np
+from tqdm import tqdm
+from collections import defaultdict
+from rdkit.Chem import AllChem
+from rdkit import Chem
+from load_data import load_data, load_data_long
+from sklearn.metrics import f1_score
+from sklearn.metrics import precision_score
+from sklearn.metrics import recall_score
+from sklearn.metrics import roc_auc_score, roc_curve, auc
+
+def write_record(args, message):
+
+    fw = open('data_{}_graph_{}_seq_{}_fu_{}.txt'.format(args.dataset, args.graph, args.sequence, args.fusion), 'a')
+    fw.write('{}\n'.format(message))
+    fw.close()
+
+def get_args():
+    parser = argparse.ArgumentParser(description='pytorch version')
+    parser.add_argument('--agg_func', type=str, default='MEAN')
+    # parser.add_argument('--agg_func', type=str, default='MAX')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--b_sz', type=int, default=32)
+    parser.add_argument('--seed', type=int, default=824)
+    parser.add_argument('--cuda', type=bool, help='use CUDA')
+    parser.add_argument('--gcn', action='store_true')
+    parser.add_argument('--unsup_loss', type=str, default='margin')
+    parser.add_argument('--max_vali_f1', type=float, default=0)
+    parser.add_argument('--name', type=str, default='debug')
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--input_dim', type=int, default=64)
+    parser.add_argument('--hidden_size', type=int, default=64)
+    parser.add_argument('--latent_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--warmup', type=float, default=0.15)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--output_size_graph', type=int, default=64)
+    parser.add_argument('--graph', type=bool, default=True)
+    parser.add_argument('--sequence', type=bool, default=True)
+    parser.add_argument('--fusion', type=bool, default=False)
+    parser.add_argument('--dataset', type=str)
+    parser.add_argument('--load_long', type=bool, default=True)
+    args = parser.parse_args()
+    return args
+
+def evlauation(pred, label):
+
+    macro_precision = precision_score(label, pred)
+    macro_recall = recall_score(label, pred)
+    macro_f1 = f1_score(label, pred, average='macro')
+    micro_f1 = f1_score(label, pred, average='micro')
+    return macro_precision, macro_recall, macro_f1, micro_f1
+def evlauation_auc(pred, label):
+
+    fpr, tpr, _  = roc_curve(label, pred[:, 1], pos_label=1)
+    auc_score = auc(fpr, tpr)
+    fpr2, tpr2, _  = roc_curve(label, pred[:, 0], pos_label=0)
+    auc_score2 = auc(fpr2, tpr2)
+    return auc_score, fpr, tpr
+
+def main(options, d_name):
+    args = get_args()
+    args.graph = options[0]
+    args.sequence = options[1]
+    args.fusion = options[2]
+    args.dataset = d_name
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    if torch.cuda.is_available():
+        if not args.cuda:
+            print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+        else:
+            device_id = torch.cuda.current_device()
+            print('using device', device_id, torch.cuda.get_device_name(device_id))
+    write_record(args, '{}'.format(str(args)))
+    args.device = torch.device("cuda" if args.cuda else "cpu")
+    print('current running on the device: {} with loading type: {}'.format(args.device, args.load_long))
+    write_record(args, 'current running on the device: {} with loading type: {}'.format(args.device, args.load_long))
+    print('data: {} graph: {} seq: {} fusion: {}'.format(args.dataset, args.graph, args.sequence, args.fusion))
+    write_record(args, 'data: {} graph: {} seq: {} fusion: {}'.format(args.dataset, args.graph, args.sequence, args.fusion))
+
+    if args.unsup_loss == 'margin':
+        num_neg = 6
+    elif args.unsup_loss == 'normal':
+        num_neg = 100
+    if args.load_long:
+        args.train_data, args.train_labels, args.test_data, args.test_labels = load_data_long(args.dataset, args.device)
+    else:
+       args.train_data, args.train_labels, args.test_data, args.test_labels = load_data(args.dataset, args.device)
+    args.input_size_graph = args.train_data['features'][0].size(1)
+    model = Model(args)
+    model.to(args.device)
+    multiclass_metrics = []
+    for epoch in range(1, args.epochs):
+        train_graphs = np.arange(len(args.train_data['adj_lists']))
+        np.random.shuffle(train_graphs)
+        losses = 0.00
+        for graph_index in tqdm(train_graphs, desc=f'Epoch {epoch}', ascii=True, leave=False):
+            loss = model.train(graph_index, epoch)
+            losses += loss.item()
+        test_graphs = np.arange(len(args.test_data['adj_lists']))
+        np.random.shuffle(test_graphs)
+        outs = torch.zeros(args.test_labels.shape[0], 2)
+        for graph_index in tqdm(test_graphs, desc=f'Epoch {epoch}', ascii=True, leave=False):
+            out = model.test(graph_index)
+            outs[graph_index, :] = out
+        test_pred = F.softmax(outs, dim=1)
+        test_pred_label = torch.max(test_pred, 1)[1]
+        test_pred = test_pred.cpu().detach().numpy()
+        test_pred_label = test_pred_label.cpu().detach().numpy()
+        acc = evlauation(test_pred_label, args.test_labels)
+        auc_score, fpr, tpr = evlauation_auc(test_pred, args.test_labels)
+        multiclass_metrics.append([auc_score,  acc])
+        best_auc = sorted(multiclass_metrics, key=lambda x: x[0], reverse=True)[0][0]
+        print('-------------' * 5)
+        print('epoch: {} acc:{:.4f} auc:{:.4f}'.format(epoch,acc, auc_score))
+        write_record(args, 'epoch: {} acc:{:.4f} auc:{:.4f}'.format(epoch,acc, auc_score))
+
+if __name__ == '__main__':
+    d_name = "NR.AR"
+    option_list = [[True, True, True], [True, False, False], [False, True, False]]
+    for op in option_list:
+        main(op, d_name)
